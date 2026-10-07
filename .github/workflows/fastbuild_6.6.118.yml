@@ -453,7 +453,6 @@ jobs:
             echo "CONFIG_CDROM=m" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_BLK_DEV_SR=m" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_CHR_DEV_SG=m" >> ./arch/arm64/configs/gki_defconfig
-            echo "CONFIG_SCSI_CONSTANTS=y" >> ./arch/arm64/configs/gki_defconfig
             
             echo "CONFIG_NTSYNC=y" >> ./arch/arm64/configs/gki_defconfig
             if [[ "${{ github.event.inputs.droidspaces_enable }}" == "extend" ]]; then
