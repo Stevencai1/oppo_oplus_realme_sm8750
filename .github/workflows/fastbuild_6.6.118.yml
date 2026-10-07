@@ -102,6 +102,7 @@ jobs:
     outputs:
       ksuver: ${{ steps.ksu_version.outputs.ksuver }}
       ak3name: ${{ steps.create_zip.outputs.ak3name }}
+      has_kmods: ${{ steps.collect_kmods.outputs.has_kmods }}
     permissions:
       actions: write
       contents: read
@@ -123,7 +124,7 @@ jobs:
           
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lib/ccache-x86-64 -O ccache &&
           sudo cp -f ./ccache /usr/bin/ccache &&
-          sudo chmod +x /usr/bin/ccache &&
+          sudo chmod +x ./ccache &&
           rm -f ./ccache &
           
           echo "正在克隆源码仓库..."
@@ -448,7 +449,7 @@ jobs:
             echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> ./arch/arm64/configs/gki_defconfig
             
-            # 开启光驱与 SCSI 相关驱动模块（=m 构建，隔离风险不破损 UFS KMI）
+            # 开启光驱与 SCSI 相关驱动模块（=m 构建）
             echo "CONFIG_CDROM=m" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_BLK_DEV_SR=m" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_CHR_DEV_SG=m" >> ./arch/arm64/configs/gki_defconfig
@@ -564,10 +565,8 @@ jobs:
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
           
-          # 生成 defconfig
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
-          # 核心构建：同时构建 Image 和 modules 模块
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image modules
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out WERROR=0 HOSTCFLAGS="-Wno-error" KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out WERROR=0 HOSTCFLAGS="-Wno-error" KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image modules
           
           echo "内核及模块编译完成！"
           echo "ccache状态："
@@ -659,19 +658,22 @@ jobs:
           zip -z ../$AK3_NAME < ./ak3.log
 
       - name: 收集并打包内核驱动模块 (.ko)
+        id: collect_kmods
         run: |
           cd kernel_workspace
           mkdir -p ./release_kmods
-          echo "正在检索已编译出的 .ko 模块..."
-          find common/out -type f -name "*.ko" -exec cp -v {} ./release_kmods/ \;
+          echo "正在检索已编译出的 CD-ROM / SCSI 驱动模块..."
+          find common/out -type f \( -name "cdrom.ko" -o -name "sr_mod.ko" -o -name "sg.ko" \) -exec cp -v {} ./release_kmods/ \;
           if [ "$(ls -A ./release_kmods 2>/dev/null)" ]; then
-            echo ">>> 成功收集到以下内核模块："
+            echo ">>> 成功提取以下模块："
             ls -lh ./release_kmods/
             cd ./release_kmods
             zip -r ../cdrom_kmods.zip ./*
             cd ..
+            echo "has_kmods=true" >> $GITHUB_OUTPUT
           else
-            echo ">>> 未发现任何独立 .ko 模块，跳过打包"
+            echo ">>> 未发现 cdrom/sr_mod/sg 模块"
+            echo "has_kmods=false" >> $GITHUB_OUTPUT
           fi
 
       - name: 上传 Ccache 调试日志
@@ -682,14 +684,17 @@ jobs:
           path: ${{ github.workspace }}/kernel_workspace/ccache.log
           archive: true
 
-      - name: 上传构建工件
+      - name: 上传 AnyKernel3 刷机包工件
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.create_zip.outputs.ak3name }}
-          path: |
-            ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
-            ${{ github.workspace }}/kernel_workspace/cdrom_kmods.zip
-            ${{ github.workspace }}/kernel_workspace/release_kmods/*.ko
+          path: ${{ github.workspace }}/kernel_workspace/${{ steps.create_zip.outputs.ak3name }}
+          archive: false
+
+      - name: 上传 CD-ROM 驱动模块包工件
+        if: steps.collect_kmods.outputs.has_kmods == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/cdrom_kmods.zip
           archive: false
 
   release:
@@ -701,12 +706,31 @@ jobs:
       actions: read
       
     steps:
-      - name: 下载工件
+      - name: 下载 AnyKernel3 刷机包
         uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.ak3name }}
           path: ./release_zips
           skip-decompress: true
+
+      - name: 下载 CD-ROM 驱动模块包
+        if: needs.build.outputs.has_kmods == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: cdrom_kmods.zip
+          path: ./release_zips
+          skip-decompress: true
+
+      - name: 解压模块以供单独发布
+        run: |
+          cd release_zips
+          if [ -f cdrom_kmods.zip ]; then
+            echo ">>> 解压 cdrom_kmods.zip 出单独 .ko 文件..."
+            unzip -o cdrom_kmods.zip
+          fi
+          echo ">>> 待发布的全部文件："
+          ls -lh ./
 
       - name: 设置环境变量
         run: |
@@ -765,7 +789,7 @@ jobs:
           - KSU原版管理器下载：[KernelSU](https://github.com/tiann/KernelSU/releases)
           
           ### 💿 附加驱动模块 (Kernel Modules)
-          - 本次构建生成了独立内核驱动模块（如 `cdrom.ko`, `sr_mod.ko`, `sg.ko`），包含在附件 `cdrom_kmods.zip` 中，亦可直接下载单独的 `.ko` 文件。
+          - 本次构建生成了独立内核驱动模块（`cdrom.ko`, `sr_mod.ko`, `sg.ko`），包含在附件 `cdrom_kmods.zip` 中，亦可直接下载单独的 `.ko` 文件。
           - 针对 Droidspaces / mpv cdda 场景，插入 OTG 光驱前执行以下命令手动加载：
             ```bash
             su
@@ -785,7 +809,6 @@ jobs:
           #### ※※※刷写内核有风险，为防止出现意外导致手机变砖，在刷入内核前请务必用[KernelFlasher](https://github.com/capntrips/KernelFlasher)等软件备份boot等关键启动分区!※※※
           EOF
 
-          # 动态匹配并上载所有存在的 zip 和 ko 附件
           UPLOAD_FILES=()
           for f in ./release_zips/AnyKernel3_*.zip ./release_zips/cdrom_kmods.zip ./release_zips/*.ko; do
             [ -f "$f" ] && UPLOAD_FILES+=("$f")
